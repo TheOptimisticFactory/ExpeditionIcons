@@ -131,11 +131,26 @@ public class PathPlanner
             return false;
         if (Vector2.Clamp(position, environment.ExclusionArea.Min, environment.ExclusionArea.Max) == position)
             return false;
-        for (var i = 1; i <= _validatedPoints; i++)
+        // Bresenham grid-raycast — every cell on the line must be walkable
+        var x0 = (int)previousPosition.X;
+        var y0 = (int)previousPosition.Y;
+        var x1 = (int)position.X;
+        var y1 = (int)position.Y;
+        var dx = Math.Abs(x1 - x0);
+        var dy = Math.Abs(y1 - y0);
+        var sx = x0 < x1 ? 1 : -1;
+        var sy = y0 < y1 ? 1 : -1;
+        var err = dx - dy;
+
+        while (true)
         {
-            var l = i / (float)_validatedPoints;
-            if (!environment.IsValidPlacement(Vector2.Lerp(previousPosition, position, l)))
+            if (!environment.IsValidPlacement(new Vector2(x0, y0)))
                 return false;
+            if (x0 == x1 && y0 == y1)
+                break;
+            var e2 = 2 * err;
+            if (e2 > -dy) { err -= dy; x0 += sx; }
+            if (e2 < dx)  { err += dx; y0 += sy; }
         }
         return true;
     }
