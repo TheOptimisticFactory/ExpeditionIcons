@@ -15,6 +15,7 @@ using ExileCore.Shared.Nodes;
 using ExpeditionIcons.PathPlannerData;
 using GameOffsets.Native;
 using ImGuiNET;
+using Newtonsoft.Json;
 using SharpDX;
 using Vector2 = System.Numerics.Vector2;
 using Vector3 = System.Numerics.Vector3;
@@ -38,6 +39,7 @@ public class ExpeditionIcons : BaseSettingsPlugin<ExpeditionIconsSettings>
     //TODO
     private const int ExplosiveBaseRange = 87;
     private const int ExplosiveBaseRadius = 30;
+    private const int DetonatorAbsentFrameThreshold = 10;
 
     private readonly ConcurrentDictionary<string, List<ExpeditionMarkerIconDescription>> _relicModIconMapping = new();
     private readonly ConcurrentDictionary<string, ExpeditionMarkerIconDescription> _metadataIconMapping = new();
@@ -54,6 +56,7 @@ public class ExpeditionIcons : BaseSettingsPlugin<ExpeditionIconsSettings>
     private PathPlannerRunner _plannerRunner;
     private (Vector2, float)? _detonatorPos;
     private bool _zoneCleared;
+    private int _detonatorAbsentFrames = 0;
     private int[][] _pathfindingData;
     private Vector2i _areaDimensions;
     private List<float> _scoreHistory = [];
@@ -67,24 +70,24 @@ public class ExpeditionIcons : BaseSettingsPlugin<ExpeditionIconsSettings>
     private (Vector2 Pos, float Rotation)? DetonatorPos => _detonatorPos ??= RealDetonatorPos;
 
     private (Vector2, float)? RealDetonatorPos => DetonatorEntity is { } e
-        ? (e.GridPosNum, e.GetComponent<Positioned>().Rotation)
+        ? (e.GridPosNum, e.GetComponent<Positioned>()?.Rotation ?? 0f)
         : null;
 
     private Entity DetonatorEntity =>
         GameController.EntityListWrapper.ValidEntitiesByType[EntityType.IngameIcon]
-            .FirstOrDefault(x => x.Path == "Metadata/MiscellaneousObjects/Expedition/ExpeditionDetonator");
+            ?.FirstOrDefault(x => x.Path == "Metadata/MiscellaneousObjects/Expedition/ExpeditionDetonator");
 
-    private int PlacedExplosiveCount => ExpeditionInfo.PlacedExplosiveCount;
-    private Vector2i[] PlacedExplosives => ExpeditionInfo.PlacedExplosiveGridPositions;
+    private int PlacedExplosiveCount => ExpeditionInfo?.PlacedExplosiveCount ?? 0;
+    private Vector2i[] PlacedExplosives => ExpeditionInfo?.PlacedExplosiveGridPositions;
 
     private Vector2i? PlacementIndicatorPos =>
-        ExpeditionInfo.IsExplosivePlacementActive
+        ExpeditionInfo?.IsExplosivePlacementActive == true
             ? GameController.EntityListWrapper.ValidEntitiesByType[EntityType.MiscellaneousObjects]
-                  .FirstOrDefault(x => x.Path == "Metadata/MiscellaneousObjects/Expedition/ExpeditionPlacementIndicator")?.GridPosNum.RoundToVector2I() ??
+                  ?.FirstOrDefault(x => x.Path == "Metadata/MiscellaneousObjects/Expedition/ExpeditionPlacementIndicator")?.GridPosNum.RoundToVector2I() ??
               ExpeditionInfo.PlacementIndicatorGridPosition
             : null;
 
-    private ExpeditionDetonatorInfo ExpeditionInfo => GameController.IngameState.IngameUi.ExpeditionDetonatorElement.Info;
+    private ExpeditionDetonatorInfo ExpeditionInfo => GameController.IngameState.IngameUi.ExpeditionDetonatorElement?.Info;
 
     private RectangleF LocalWindowRect => GameController.Window.GetWindowRectangleTimeCache with { Location = SharpDX.Vector2.Zero };
 
@@ -98,6 +101,7 @@ public class ExpeditionIcons : BaseSettingsPlugin<ExpeditionIconsSettings>
         RegisterHotkey(Settings.PlannerSettings.StartSearchHotkey);
         RegisterHotkey(Settings.PlannerSettings.StopSearchHotkey);
         RegisterHotkey(Settings.PlannerSettings.ClearSearchHotkey);
+        GameController.PluginBridge.SaveMethod("ExpeditionIcons.BestPathJson", () => SerializeBestPath());
         return base.Initialise();
     }
 
@@ -136,6 +140,7 @@ public class ExpeditionIcons : BaseSettingsPlugin<ExpeditionIconsSettings>
         {
             run.Stop();
             _plannerRunner = null;
+            _detonatorAbsentFrames = 0;
             _scoreHistory = [];
             _editedPath = null;
             _editedIndex = null;
@@ -154,6 +159,7 @@ public class ExpeditionIcons : BaseSettingsPlugin<ExpeditionIconsSettings>
         _detonatorPos = null;
         _cachedEntities.Clear();
         _zoneCleared = false;
+        _detonatorAbsentFrames = 0;
         _pathfindingData = GameController.IngameState.Data.RawPathfindingData;
         _areaDimensions = GameController.IngameState.Data.AreaDimensions;
     }
@@ -239,11 +245,28 @@ public class ExpeditionIcons : BaseSettingsPlugin<ExpeditionIconsSettings>
         _playerGridPos = playerGridPos.Value;
         if (detonatorPos is { Pos: var dp } && _playerGridPos.Distance(dp) < 90)
         {
-            _zoneCleared = DetonatorEntity?.IsTargetable != true;
-            if (_zoneCleared)
+            // --- Detonator gone confirmation logic ---
+            // We only trigger zone-cleared once the detonator entity has been
+            // confirmed absent from the entity list for DetonatorAbsentFrameThreshold
+            // consecutive frames. This prevents the path from disappearing during
+            // the detonation animation when the entity briefly becomes non-targetable
+            // or transiently drops from the list before truly being gone.
+            var entity = DetonatorEntity;
+            if (entity != null && entity.IsValid && entity.IsTargetable)
             {
-                ClearSearch();
-                return null;
+                // Detonator is alive and well — reset the counter
+                _detonatorAbsentFrames = 0;
+            }
+            else
+            {
+                // Entity is gone, invalid, or non-targetable — increment counter
+                _detonatorAbsentFrames++;
+                if (_detonatorAbsentFrames >= DetonatorAbsentFrameThreshold)
+                {
+                    _zoneCleared = true;
+                    ClearSearch();
+                    return null;
+                }
             }
         }
 
@@ -952,5 +975,32 @@ public class ExpeditionIcons : BaseSettingsPlugin<ExpeditionIconsSettings>
             entity.GetComponent<Render>()?.Z,
             entity.GetComponent<Render>()?.BoundsNum is { } b ? Math.Min(b.X, b.Y) : null,
             entity.GetComponent<MinimapIcon>()?.IsHide);
+    }
+
+    private string SerializeBestPath()
+    {
+        try
+        {
+            var score = EditedOrNativeScore;
+            if (score is not { PerPointScore: { Count: > 0 } })
+                return null;
+            return JsonConvert.SerializeObject(new
+            {
+                points = score.PerPointScore.Select(p => new
+                {
+                    x = p.Point.X,
+                    y = p.Point.Y,
+                    scoreDiff = p.ScoreDiff,
+                    newRelics = p.NewRelics,
+                    loot = p.Loot
+                }),
+                totalScore = score.TotalScore
+            });
+        }
+        catch (Exception ex)
+        {
+            DebugWindow.LogError($"ExpeditionIcons SerializeBestPath failed: {ex.Message}");
+            return null;
+        }
     }
 }

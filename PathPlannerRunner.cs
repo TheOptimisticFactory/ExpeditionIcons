@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -24,7 +23,13 @@ public class PathPlannerRunner
     {
         get
         {
-            if (BestValues?.Where(x => x != null).MaxBy(x => x.Score)?.Path is not { } bestPath)
+            // Fixed: single foreach pass instead of LINQ MaxBy + Where — no allocation
+            BestValue best = null;
+            if (BestValues != null)
+                foreach (var v in BestValues)
+                    if (v != null && (best == null || v.Score > best.Score))
+                        best = v;
+            if (best?.Path is not { } bestPath)
             {
                 return null;
             }
@@ -41,7 +46,19 @@ public class PathPlannerRunner
         }
     }
 
-    public double CurrentBestScore => BestValues?.Max(x => x?.Score ?? 0) ?? 0;
+    // Fixed: single foreach pass instead of LINQ Max — no allocation
+    public double CurrentBestScore
+    {
+        get
+        {
+            var best = 0.0;
+            if (BestValues == null) return best;
+            foreach (var v in BestValues)
+                if (v != null && v.Score > best)
+                    best = v.Score;
+            return best;
+        }
+    }
 
     private Task _task;
 
@@ -58,7 +75,7 @@ public class PathPlannerRunner
         var threadCount = Math.Max(settings.SearchThreads.Value, 1);
         BestValues = new BestValue[threadCount];
         var tasks = new List<Task>();
-        for (int i = 0; i < threadCount; i++)
+        for (var i = 0; i < threadCount; i++)
         {
             var ii = i;
             tasks.Add(Task.Run(() =>

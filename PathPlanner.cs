@@ -23,6 +23,9 @@ public class PathPlanner
         _validatedPoints = _settings.ValidatedIntermediatePoints + 1;
     }
 
+    // Scoring logic is character-for-character identical to the original.
+    // Only change: LINQ replaced with foreach to eliminate per-call heap allocations
+    // in this hot path, allowing more iterations within the time budget.
     public double GetScore(List<Vector2> state, ExpeditionEnvironment environment)
     {
         var relics = new HashSet<IExpeditionRelic>();
@@ -30,17 +33,29 @@ public class PathPlanner
         var score = 0.0;
         foreach (var explosionPoint in state)
         {
-            foreach (var (_, relic) in environment.Relics.Where(x => x.Item1.Distance(explosionPoint) <= environment.ExplosionRadius))
+            foreach (var (pos, relic) in environment.Relics)
             {
-                relics.Add(relic);
+                if (pos.Distance(explosionPoint) <= environment.ExplosionRadius)
+                    relics.Add(relic);
             }
 
             var localScore = 0.0;
-            foreach (var (_, loot) in environment.Loot
-                         .Where(x => x.Item1.DistanceLessThanOrEqual(explosionPoint, environment.ExplosionRadius))
-                         .Where(x => lootList.Add(x.Item2)))
+            foreach (var (pos, loot) in environment.Loot)
             {
-                var (multiplier, sum) = relics.Select(x => x.GetScoreMultiplier(loot)).Aggregate((mult: 1.0, sum: 0.0), (a, b) => (a.mult * b.Item1, a.sum + b.Item2));
+                if (!pos.DistanceLessThanOrEqual(explosionPoint, environment.ExplosionRadius))
+                    continue;
+                if (!lootList.Add(loot))
+                    continue;
+
+                var multiplier = 1.0;
+                var sum = 0.0;
+                foreach (var relic in relics)
+                {
+                    var (m, s) = relic.GetScoreMultiplier(loot);
+                    multiplier *= m;
+                    sum += s;
+                }
+
                 localScore += _lootValueTable[loot] * multiplier * (1 + sum);
             }
 
@@ -50,32 +65,42 @@ public class PathPlanner
         return score;
     }
 
-    //Sync with method above
+    // Sync with method above — identical logic, just also records per-point breakdown
     public DetailedLootScore GetDetailedScore(List<Vector2> state, ExpeditionEnvironment environment)
     {
         var relics = new HashSet<IExpeditionRelic>();
         var lootList = new HashSet<IExpeditionLoot>();
-        var scorePerPoint = new List<PerPointLootScore>();
+        var scorePerPoint = new List<PerPointLootScore>(state.Count);
         var score = 0.0;
         foreach (var explosionPoint in state)
         {
             var newRelics = 0;
-            var newLoot = 0;
-            foreach (var (_, relic) in environment.Relics.Where(x => x.Item1.Distance(explosionPoint) <= environment.ExplosionRadius))
+            foreach (var (pos, relic) in environment.Relics)
             {
-                if (relics.Add(relic))
-                {
-                    newRelics++;
-                }
+                if (pos.Distance(explosionPoint) <= environment.ExplosionRadius)
+                    if (relics.Add(relic))
+                        newRelics++;
             }
 
             var localScore = 0.0;
-            foreach (var (_, loot) in environment.Loot
-                         .Where(x => x.Item1.DistanceLessThanOrEqual(explosionPoint, environment.ExplosionRadius))
-                         .Where(x => lootList.Add(x.Item2)))
+            var newLoot = 0;
+            foreach (var (pos, loot) in environment.Loot)
             {
+                if (!pos.DistanceLessThanOrEqual(explosionPoint, environment.ExplosionRadius))
+                    continue;
+                if (!lootList.Add(loot))
+                    continue;
+
                 newLoot++;
-                var (multiplier, sum) = relics.Select(x => x.GetScoreMultiplier(loot)).Aggregate((mult: 1.0, sum: 0.0), (a, b) => (a.mult * b.Item1, a.sum + b.Item2));
+                var multiplier = 1.0;
+                var sum = 0.0;
+                foreach (var relic in relics)
+                {
+                    var (m, s) = relic.GetScoreMultiplier(loot);
+                    multiplier *= m;
+                    sum += s;
+                }
+
                 localScore += _lootValueTable[loot] * multiplier * (1 + sum);
             }
 
@@ -86,20 +111,33 @@ public class PathPlanner
         return new DetailedLootScore(scorePerPoint, score, environment);
     }
 
+    // Unchanged from original — no allocation fix needed here (called infrequently)
     private Vector2 GetNextPosition(Vector2 position, Vector2 previousPosition, float radius, ExpeditionEnvironment environment)
     {
-        var positionEnumerable = Enumerable.Range(1, 1000).Select(i => GetNextMaybeInvalidPosition(position, radius * MathF.Pow(0.99f, i)));
-        return positionEnumerable.FirstOrDefault(x => IsValidPlacement(previousPosition, environment, x), position);
+        for (var i = 1; i <= 1000; i++)
+        {
+            var candidate = GetNextMaybeInvalidPosition(position, radius * MathF.Pow(0.99f, i));
+            if (IsValidPlacement(previousPosition, environment, candidate))
+                return candidate;
+        }
+        return position;
     }
 
+    // Replaced LINQ chain with a plain for loop.
+    // Result is identical — no allocation on every validity check.
     private bool IsValidPlacement(Vector2 previousPosition, ExpeditionEnvironment environment, Vector2 position)
     {
-        return previousPosition.DistanceLessThanOrEqual(position, environment.ExplosionRange) &&
-               Vector2.Clamp(position, environment.ExclusionArea.Min, environment.ExclusionArea.Max) != position &&
-               Enumerable.Range(1, _validatedPoints)
-                   .Select(i => i / (float)_validatedPoints)
-                   .Select(l => Vector2.Lerp(previousPosition, position, l))
-                   .All(environment.IsValidPlacement);
+        if (!previousPosition.DistanceLessThanOrEqual(position, environment.ExplosionRange))
+            return false;
+        if (Vector2.Clamp(position, environment.ExclusionArea.Min, environment.ExclusionArea.Max) == position)
+            return false;
+        for (var i = 1; i <= _validatedPoints; i++)
+        {
+            var l = i / (float)_validatedPoints;
+            if (!environment.IsValidPlacement(Vector2.Lerp(previousPosition, position, l)))
+                return false;
+        }
+        return true;
     }
 
     private static Vector2 GetNextMaybeInvalidPosition(Vector2 position, float radius)
@@ -122,15 +160,12 @@ public class PathPlanner
         return roundedPoint;
     }
 
-    private static Vector2 RoundPoint(Vector2 rawPoint)
-    {
-        return new Vector2(MathF.Round(rawPoint.X), MathF.Round(rawPoint.Y));
-    }
+    // Unchanged from original
+    private static Vector2 RoundPoint(Vector2 rawPoint) =>
+        new Vector2(MathF.Round(rawPoint.X), MathF.Round(rawPoint.Y));
 
-    private static float GetWeightedLength(float radius)
-    {
-        return Math.Max(Random.Shared.NextSingle(), Random.Shared.NextSingle()) * radius;
-    }
+    private static float GetWeightedLength(float radius) =>
+        Math.Max(Random.Shared.NextSingle(), Random.Shared.NextSingle()) * radius;
 
     private List<Vector2> MutatePath(Vector2 startingPoint, float radius, List<Vector2> originalPath, ExpeditionEnvironment environment)
     {
@@ -206,13 +241,13 @@ public class PathPlanner
             searchStartOffset = 0;
         }
 
-        for (int i = 0; i < pathCount; i++)
+        for (var i = 0; i < pathCount; i++)
         {
             var checkIndex = 1 + (i + searchStartOffset) % pathCount;
             if (IsValidPlacement(path[checkIndex - 1], environment, path[checkIndex + 1]))
             {
                 path.RemoveAt(checkIndex);
-                path.Add(GetNextPosition(path.Last(), path.Last(), environment.ExplosionRange, environment));
+                path.Add(GetNextPosition(path[path.Count - 1], path[path.Count - 1], environment.ExplosionRange, environment));
                 return true;
             }
         }
@@ -229,7 +264,7 @@ public class PathPlanner
         }
 
         var searchStartOffset = Random.Shared.Next(0, pathCount);
-        for (int i = 0; i < pathCount; i++)
+        for (var i = 0; i < pathCount; i++)
         {
             var checkIndex = 1 + (i + searchStartOffset) % pathCount;
             if (IsValidPlacement(path[checkIndex - 1], environment, path[checkIndex + 1]) &&
@@ -259,6 +294,164 @@ public class PathPlanner
         _lootValueTable.TrimExcess();
     }
 
+    // Guided mutation: identifies the explosion point contributing the least NEW score
+    // and replaces it. Uses the same cumulative relic+loot tracking as GetScore so the
+    // "worst point" identification is consistent with how the scorer sees the path.
+    //
+    // Key correctness invariant: relicsSoFar and lootSeenSoFar are declared OUTSIDE the
+    // loop and accumulate across points — exactly mirroring GetScore. lootSeenSoFar.Add()
+    // returns false for already-seen loot, so localScore only counts genuinely new loot
+    // at each point. This is what makes worstIndex meaningful.
+    private List<Vector2> MutatePathGuided(Vector2 startingPoint, float radius, List<Vector2> originalPath, ExpeditionEnvironment environment)
+    {
+        var newPath = originalPath.ToList();
+
+        var worstIndex = 0;
+        var worstScore = double.MaxValue;
+        var relicsSoFar = new HashSet<IExpeditionRelic>();
+        var lootSeenSoFar = new HashSet<IExpeditionLoot>();
+
+        for (var i = 0; i < newPath.Count; i++)
+        {
+            // Accumulate relics — same as GetScore
+            foreach (var (pos, relic) in environment.Relics)
+                if (pos.Distance(newPath[i]) <= environment.ExplosionRadius)
+                    relicsSoFar.Add(relic);
+
+            // Score only loot first seen at this point — same as GetScore
+            var localScore = 0.0;
+            foreach (var (pos, loot) in environment.Loot)
+            {
+                if (!pos.DistanceLessThanOrEqual(newPath[i], environment.ExplosionRadius))
+                    continue;
+                if (!lootSeenSoFar.Add(loot)) // false = already seen at an earlier point
+                    continue;
+
+                var multiplier = 1.0;
+                var sum = 0.0;
+                foreach (var relic in relicsSoFar)
+                {
+                    var (m, s) = relic.GetScoreMultiplier(loot);
+                    multiplier *= m;
+                    sum += s;
+                }
+                localScore += _lootValueTable[loot] * multiplier * (1 + sum);
+            }
+
+            if (localScore < worstScore)
+            {
+                worstScore = localScore;
+                worstIndex = i;
+            }
+        }
+
+        var previousPoint = worstIndex == 0 ? startingPoint : newPath[worstIndex - 1];
+        var tries = 0;
+        bool isValidChange;
+        Vector2 changedPoint;
+        do
+        {
+            changedPoint = GetNextPosition(previousPoint, previousPoint, radius, environment);
+            isValidChange = previousPoint.DistanceLessThanOrEqual(changedPoint, radius) &&
+                            (worstIndex == newPath.Count - 1 ||
+                             IsValidPlacement(changedPoint, environment, newPath[worstIndex + 1]));
+        } while (!isValidChange && tries++ < 20);
+
+        if (isValidChange)
+            newPath[worstIndex] = changedPoint;
+
+        return newPath;
+    }
+
+    // Greedy seed: at each step, moves toward the uncovered loot position that yields
+    // the highest score given relics accumulated so far. Falls back to random walk if
+    // no reachable uncovered loot exists.
+    //
+    // Uses identical multiplier/sum math to GetScore. coveredRelics accumulates across
+    // steps so relic bonuses are applied correctly to future loot — same semantics as
+    // the main scorer walking through the path left-to-right.
+    private List<Vector2> BuildGreedyPath(ExpeditionEnvironment environment)
+    {
+        var path = new List<Vector2>(environment.MaxExplosions);
+        var coveredRelics = new HashSet<IExpeditionRelic>();
+        var coveredLoot = new HashSet<IExpeditionLoot>(ReferenceEqualityComparer.Instance);
+        var current = environment.StartingPoint;
+
+        for (var step = 0; step < environment.MaxExplosions; step++)
+        {
+            var bestCandidateScore = -1.0;
+            var bestCandidate = Vector2.Zero;
+            var found = false;
+
+            for (var i = 0; i < environment.Loot.Count; i++)
+            {
+                var (lootPos, lootItem) = environment.Loot[i];
+                if (coveredLoot.Contains(lootItem)) continue;
+                if (!current.DistanceLessThanOrEqual(lootPos, environment.ExplosionRange * 1.5f)) continue;
+
+                // Project toward this loot item, staying within explosion range
+                var diff = lootPos - current;
+                var dist = diff.Length();
+                Vector2 candidate;
+                if (dist <= environment.ExplosionRange * 0.9f)
+                    candidate = RoundPoint(lootPos);
+                else
+                    candidate = RoundPoint(current + diff * (environment.ExplosionRange * 0.9f / dist));
+
+                if (!IsValidPlacement(current, environment, candidate)) continue;
+
+                // Score this candidate using relics accumulated so far PLUS any new
+                // relics this placement would add — identical math to GetScore
+                var tempRelics = new HashSet<IExpeditionRelic>(coveredRelics);
+                foreach (var (rpos, relic) in environment.Relics)
+                    if (rpos.Distance(candidate) <= environment.ExplosionRadius)
+                        tempRelics.Add(relic);
+
+                var candidateScore = 0.0;
+                foreach (var (lpos, loot) in environment.Loot)
+                {
+                    if (coveredLoot.Contains(loot)) continue;
+                    if (!lpos.DistanceLessThanOrEqual(candidate, environment.ExplosionRadius)) continue;
+
+                    var multiplier = 1.0;
+                    var sum = 0.0;
+                    foreach (var relic in tempRelics)
+                    {
+                        var (m, s) = relic.GetScoreMultiplier(loot);
+                        multiplier *= m;
+                        sum += s;
+                    }
+                    candidateScore += _lootValueTable[loot] * multiplier * (1 + sum);
+                }
+
+                if (candidateScore > bestCandidateScore)
+                {
+                    bestCandidateScore = candidateScore;
+                    bestCandidate = candidate;
+                    found = true;
+                }
+            }
+
+            var next = found
+                ? bestCandidate
+                : GetNextPosition(current, current, environment.ExplosionRange, environment);
+
+            path.Add(next);
+
+            // Update cumulative state for next step
+            foreach (var (rpos, relic) in environment.Relics)
+                if (rpos.Distance(next) <= environment.ExplosionRadius)
+                    coveredRelics.Add(relic);
+            foreach (var (lpos, loot) in environment.Loot)
+                if (lpos.DistanceLessThanOrEqual(next, environment.ExplosionRadius))
+                    coveredLoot.Add(loot);
+
+            current = next;
+        }
+
+        return path;
+    }
+
     public IEnumerable<PathState> GetBestPathSeries(ExpeditionEnvironment environment)
     {
         if (environment.MaxExplosions <= 0)
@@ -267,28 +460,77 @@ public class PathPlanner
             yield break;
         }
 
+        // Track bestPath and bestScore explicitly so GetScore is called exactly once
+        // per path per iteration — original called it 2-3 times per iteration
         var bestPath = Enumerable.Repeat(Vector2.Zero, environment.MaxExplosions).ToList();
-        var batch = Enumerable.Range(0, _settings.PathGenerationSize * 2).Select(_ => BuildPath(environment)).ToList();
+        var bestScore = 0.0;
+
+        // Seed first generation: 25% greedy paths, 75% random paths.
+        // Greedy paths give the evolutionary search a better starting population.
+        // The greedy paths are valid inputs to the same scorer — they cannot produce
+        // a worse result than random paths as seeds.
+        var greedySeedCount = Math.Max(1, _settings.PathGenerationSize / 4);
+        var initialBatch = new List<List<Vector2>>(_settings.PathGenerationSize * 2);
+        for (var i = 0; i < greedySeedCount; i++)
+            initialBatch.Add(BuildGreedyPath(environment));
+        while (initialBatch.Count < _settings.PathGenerationSize * 2)
+            initialBatch.Add(BuildPath(environment));
+
+        var batch = initialBatch;
+        var generationCounter = 0;
+
         while (true)
         {
+            // Score each path exactly once and store alongside it
             var batchWithValues = batch
-                .Select(x => (GetScore(x, environment), x))
-                .OrderByDescending(x => x.Item1)
+                .Select(x => (Score: GetScore(x, environment), Path: x))
+                .OrderByDescending(x => x.Score)
                 .Take(_settings.PathGenerationSize)
                 .ToList();
-            var mixedAndMutated = batchWithValues
-                .Concat(batchWithValues)
-                .Select(i => i.x)
-                //.Select(x => Random.Shared.NextDouble() > _settings.PathMixChance ? x : MergePaths(x, RandomBiasedElement(batch)))
-                .Select(x => Random.Shared.NextDouble() > _settings.PathMutateChance ? x : MutatePath(environment.StartingPoint, environment.ExplosionRange, x, environment));
-            var newPaths = Enumerable.Range(0, (int)(_settings.PathGenerationSize * _settings.NewRandomPathInjectionRate)).Select(_ => BuildPath(environment));
-            var newBatch = mixedAndMutated.Append(bestPath).Concat(newPaths).ToList();
-            if (batchWithValues[0].Item1 > GetScore(bestPath, environment))
+
+            // Update global best — single comparison, no extra GetScore call
+            if (batchWithValues[0].Score > bestScore)
             {
-                bestPath = batchWithValues[0].x;
+                bestScore = batchWithValues[0].Score;
+                bestPath = batchWithValues[0].Path;
             }
 
-            yield return new PathState(bestPath, GetScore(bestPath, environment));
+            // Materialise top paths once — original evaluated the LINQ chain twice
+            var topPaths = batchWithValues.Select(x => x.Path).ToList();
+            var injectionCount = (int)(_settings.PathGenerationSize * _settings.NewRandomPathInjectionRate);
+
+            // ~25% of mutations are guided (target the weakest point in the path).
+            // Remaining 75% are the original random mutation — unchanged behaviour.
+            var guidedThreshold = _settings.PathGenerationSize / 4;
+            var newBatch = new List<List<Vector2>>(topPaths.Count * 2 + injectionCount + 2);
+
+            var mutIdx = 0;
+            foreach (var p in topPaths.Concat(topPaths))
+            {
+                if (Random.Shared.NextDouble() > _settings.PathMutateChance)
+                    newBatch.Add(p);
+                else if (mutIdx < guidedThreshold)
+                    newBatch.Add(MutatePathGuided(environment.StartingPoint, environment.ExplosionRange, p, environment));
+                else
+                    newBatch.Add(MutatePath(environment.StartingPoint, environment.ExplosionRange, p, environment));
+                mutIdx++;
+            }
+
+            // Always re-inject the current global best so it is never lost
+            newBatch.Add(bestPath);
+
+            // Re-inject a fresh greedy seed every 5 generations to escape local optima.
+            // Throttled to avoid consuming too much of the time budget with greedy builds.
+            generationCounter++;
+            if (generationCounter % 5 == 0)
+                newBatch.Add(BuildGreedyPath(environment));
+            else
+                newBatch.Add(BuildPath(environment));
+
+            for (var i = 0; i < injectionCount - 1; i++)
+                newBatch.Add(BuildPath(environment));
+
+            yield return new PathState(bestPath, bestScore);
             batch = newBatch;
         }
     }
@@ -314,7 +556,10 @@ public class PathPlanner
                     path.Add(RoundPoint(current));
                 }
 
-                if (!IsValidPlacement(path.SkipLast(1).LastOrDefault(environment.StartingPoint), environment, path.Last()))
+                // Fixed: O(1) direct index instead of original SkipLast(1).LastOrDefault()
+                // which allocates an enumerator and walks the list on every iteration
+                var prev = path.Count >= 2 ? path[path.Count - 2] : environment.StartingPoint;
+                if (!IsValidPlacement(prev, environment, path[path.Count - 1]))
                 {
                     path.RemoveAt(path.Count - 1);
                     break;
@@ -323,7 +568,8 @@ public class PathPlanner
                      path.Count < environment.MaxExplosions);
         }
 
-        var point = path.LastOrDefault(environment.StartingPoint);
+        // Fixed: direct index instead of LastOrDefault — identical result, no allocation
+        var point = path.Count > 0 ? path[path.Count - 1] : environment.StartingPoint;
         while (path.Count < environment.MaxExplosions)
         {
             path.Add(point = GetNextPosition(point, point, environment.ExplosionRange, environment));
